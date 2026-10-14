@@ -317,7 +317,8 @@ grant execute on function public.checkout_copies(text, text[], text) to authenti
 create or replace function public.return_copy(
   p_copy_barcode text,
   p_condition text default 'BAIK',
-  p_idempotency_key text default null
+  p_idempotency_key text default null,
+  p_replacement_amount bigint default null
 )
 returns jsonb
 language plpgsql
@@ -341,6 +342,7 @@ declare
   v_amount bigint := 0;
   v_replacement bigint := 0;
   v_hold_hours integer;
+  v_hold_expires_at timestamptz;
   v_key text := nullif(p_idempotency_key, '');
 begin
   if auth.uid() is null then raise exception using errcode = '28000', message = 'UNAUTHENTICATED'; end if;
@@ -374,8 +376,11 @@ begin
   v_overdue := greatest(0, v_local_today - v_loan.due_date - v_grace);
   v_rule := coalesce(v_loan.policy_snapshot -> 'fine_rule', '{"type":"flat","per_day":500}'::jsonb);
   if p_condition = 'HILANG' then
-    v_replacement := coalesce(v_copy.acquisition_price, 0);
-    if v_replacement > 0 then v_amount := v_replacement; end if;
+    v_replacement := coalesce(p_replacement_amount, v_copy.acquisition_price);
+    if v_replacement is null or v_replacement < 0 then
+      raise exception using errcode = '22023', message = 'REPLACEMENT_AMOUNT_REQUIRED';
+    end if;
+    v_amount := v_replacement;
   else
     v_amount := public.calculate_fine(v_rule, v_overdue);
   end if;
@@ -405,15 +410,16 @@ begin
     order by r.queued_at, r.id limit 1 for update skip locked;
     if v_reservation.id is not null then
       v_hold_hours := greatest(1, coalesce((v_org.settings ->> 'hold_hours')::integer, 48));
+      v_hold_expires_at := now() + make_interval(hours => v_hold_hours);
       update public.reservations set status = 'SIAP_DIAMBIL', ready_at = now(),
-        hold_expires_at = now() + make_interval(hours => v_hold_hours), held_copy_id = v_copy.id
+        hold_expires_at = v_hold_expires_at, held_copy_id = v_copy.id, updated_at = now()
       where id = v_reservation.id;
       update public.item_copies set status = 'DITAHAN', version = version + 1, updated_at = now()
       where id = v_copy.id;
       insert into public.notifications(organization_id, type, channel, member_id, payload, dedupe_key)
       values (
         v_org_id, 'HOLD_READY', 'EMAIL', v_reservation.member_id,
-        jsonb_build_object('item_type_id', v_item.id, 'copy_barcode', v_copy.barcode, 'hold_expires_at', now() + make_interval(hours => v_hold_hours)),
+        jsonb_build_object('item_type_id', v_item.id, 'copy_barcode', v_copy.barcode, 'hold_expires_at', v_hold_expires_at),
         'HOLD_READY:' || v_reservation.id::text || ':' || (now() at time zone coalesce(nullif(v_org.timezone,''),'Asia/Jakarta'))::date::text
       ) on conflict (organization_id, dedupe_key) do nothing;
     end if;
@@ -428,12 +434,12 @@ begin
     'fine_amount', v_amount, 'overdue_days', v_overdue,
     'copy_status', (select c.status from public.item_copies c where c.id = v_copy.id),
     'reservation_id', case when v_reservation.id is not null and p_condition = 'BAIK' then v_reservation.id else null end,
-    'hold_expires_at', case when v_reservation.id is not null and p_condition = 'BAIK' then v_reservation.hold_expires_at else null end
+    'hold_expires_at', case when v_reservation.id is not null and p_condition = 'BAIK' then v_hold_expires_at else null end
   );
 end;
 $$;
-revoke all on function public.return_copy(text, text, text) from public, anon;
-grant execute on function public.return_copy(text, text, text) to authenticated;
+revoke all on function public.return_copy(text, text, text, bigint) from public, anon;
+grant execute on function public.return_copy(text, text, text, bigint) to authenticated;
 
 create or replace function public.renew_copy(
   p_copy_barcode text,
