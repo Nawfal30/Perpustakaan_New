@@ -1,5 +1,8 @@
 -- Atomic, organization-scoped operations for Pustaka Bersama.
 -- Apply after 20261014000000_initial_schema.sql.
+alter table public.reservations add column if not exists updated_at timestamptz not null default now();
+create unique index if not exists payments_reference_idempotency_uidx
+  on public.payments (organization_id, reference) where reference is not null;
 create unique index if not exists loan_events_idempotency_uidx
   on public.loan_events (organization_id, (payload ->> 'idempotency_key'))
   where payload ? 'idempotency_key';
@@ -342,12 +345,11 @@ declare
 begin
   if auth.uid() is null then raise exception using errcode = '28000', message = 'UNAUTHENTICATED'; end if;
   if p_condition not in ('BAIK','RUSAK','HILANG') then raise exception using errcode = '22023', message = 'INVALID_CONDITION'; end if;
-  if v_key is not null then
-    select (le.payload -> 'result') into v_reservation.id
-    from public.loan_events le
+  if v_key is not null and exists (
+    select 1 from public.loan_events le
     where le.event_type = 'RETURN' and le.payload ->> 'idempotency_key' = v_key
-    limit 1;
-    if found then return coalesce(to_jsonb(v_reservation), jsonb_build_object('ok', true, 'idempotent_replay', true)); end if;
+  ) then
+    return jsonb_build_object('ok', true, 'idempotent_replay', true);
   end if;
 
   select c.organization_id, c.id, l.member_id into v_org_id, v_copy_id, v_member_id
