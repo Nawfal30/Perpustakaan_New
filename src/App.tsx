@@ -779,6 +779,7 @@ function Circulation() {
   const [step, setStep] = useState<"member" | "cart" | "success">("member")
   const [scan, setScan] = useState("")
   const [condition, setCondition] = useState("BAIK")
+  const [replacementAmount, setReplacementAmount] = useState("")
   const [memberNumber, setMemberNumber] = useState("")
   const [barcodes, setBarcodes] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
@@ -787,7 +788,7 @@ function Circulation() {
 
   function reset() {
     setStep("member"); setScan(""); setMemberNumber(""); setBarcodes([])
-    setError(""); setSuccessMessage("")
+    setError(""); setSuccessMessage(""); setReplacementAmount("")
   }
   function doScan() {
     const code = scan.trim().toUpperCase()
@@ -836,7 +837,7 @@ function Circulation() {
         const due = result.loans?.map((loan) => `${loan.barcode}: jatuh tempo ${loan.due_date || "ditetapkan"}`).join(" • ")
         setSuccessMessage(`Peminjaman tersimpan. ${result.count} eksemplar diproses. ${due || ""}`)
       } else if (tab === "kembali") {
-        const result = await returnCopy(barcodes[0], condition as "BAIK" | "RUSAK" | "HILANG")
+        const result = await returnCopy(barcodes[0], condition as "BAIK" | "RUSAK" | "HILANG", replacementAmount.trim() ? Number(replacementAmount) : undefined)
         setSuccessMessage(`Pengembalian tersimpan untuk ${result.barcode || barcodes[0]}. Denda tercatat: ${new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(result.fine_amount || 0)}.${result.hold_expires_at ? " Eksemplar ditahan untuk antrean reservasi." : ""}`)
       } else {
         const result = await renewCopy(barcodes[0])
@@ -874,7 +875,7 @@ function Circulation() {
       {error && <div className="alert alert-danger" role="alert"><Icon name="warning" /><div><b>Transaksi belum diproses</b><span>{error}</span></div></div>}
       {step === "member" && <div className="circulation-empty"><div className="scan-illustration"><Icon name="scan" size={40} /><i /></div><b>{tab === "pinjam" ? "Mulai dengan kartu anggota" : `Pindai barang yang akan di${tab}`}</b><span>Scanner USB/Bluetooth dapat digunakan atau ketik kode secara manual.</span><div className="hint-row"><span><kbd>F2</kbd> Pinjam</span><span><kbd>F3</kbd> Kembali</span><span><kbd>F4</kbd> Perpanjang</span></div></div>}
       {step === "cart" && tab === "pinjam" && <Checkout memberNumber={memberNumber} barcodes={barcodes} onFinish={() => void finishTransaction()} busy={busy} />}
-      {step === "cart" && tab === "kembali" && <ReturnPanel barcode={barcodes[0] || ""} condition={condition} setCondition={setCondition} onFinish={() => void finishTransaction()} busy={busy} />}
+      {step === "cart" && tab === "kembali" && <ReturnPanel barcode={barcodes[0] || ""} condition={condition} setCondition={setCondition} replacementAmount={replacementAmount} setReplacementAmount={setReplacementAmount} onFinish={() => void finishTransaction()} busy={busy} />}
       {step === "cart" && tab === "perpanjang" && <RenewPanel barcode={barcodes[0] || ""} onFinish={() => void finishTransaction()} busy={busy} />}
       {step === "success" && <section className="card success-panel"><div className="success-mark"><Icon name="check" size={34} /></div><div className="success-title">{tab === "pinjam" ? "Peminjaman berhasil" : tab === "kembali" ? "Pengembalian berhasil" : "Perpanjangan berhasil"}</div><p>{successMessage}</p><div className="button-row"><Button variant="secondary" icon="printer" onClick={() => window.print()}>Cetak ringkasan</Button><Button onClick={reset}>Transaksi berikutnya</Button></div></section>}
     </>
@@ -966,13 +967,14 @@ function CartItem({
     </div>
   )
 }
-function ReturnPanel({ barcode, condition, setCondition, onFinish, busy }: { barcode: string; condition: string; setCondition: (s: string) => void; onFinish: () => void; busy: boolean }) {
+function ReturnPanel({ barcode, condition, setCondition, replacementAmount, setReplacementAmount, onFinish, busy }: { barcode: string; condition: string; setCondition: (s: string) => void; replacementAmount: string; setReplacementAmount: (s: string) => void; onFinish: () => void; busy: boolean }) {
   return (
     <div className="return-grid">
       <section className="card return-detail">
         <div className="section-head"><div><b>Eksemplar dipindai</b><span>{barcode || "Belum ada kode"}</span></div><Badge tone="info">AKAN DIVALIDASI</Badge></div>
         <div className="alert alert-info"><Icon name="shield" /><div><b>Pengembalian aman</b><span>Sistem mencari pinjaman aktif, menghitung denda resmi, serta meneruskan antrian dalam transaksi database.</span></div></div>
         <div className="field"><span>Kondisi saat kembali</span><div className="choice-row">{[["BAIK","Baik"],["RUSAK","Rusak"],["HILANG","Hilang"]].map(([v,label]) => <button key={v} className={condition === v ? "active" : ""} onClick={() => setCondition(v)}>{label}</button>)}</div></div>
+        {condition === "HILANG" && <Field label="Denda penggantian (Rupiah) *" value={replacementAmount} onChange={setReplacementAmount} type="number" />}
       </section>
       <section className="card payment-panel"><b>Konfirmasi pengembalian</b><span>Jika terlambat, denda ditambahkan ke buku besar. Barang rusak/hilang diperbarui sesuai kondisi.</span><Button className="wide" onClick={onFinish} disabled={!barcode || busy}>{busy ? "Memproses…" : "Proses pengembalian"}</Button></section>
     </div>
