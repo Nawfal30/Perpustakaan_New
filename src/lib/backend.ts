@@ -245,7 +245,7 @@ export async function returnCopy(barcode: string, condition: "BAIK" | "RUSAK" | 
     p_replacement_amount: replacementAmount ?? null,
   })
   if (error) fail(error, "Pengembalian gagal diproses.")
-  return data as { ok: boolean; fine_amount?: number; overdue_days?: number; copy_status?: string; hold_expires_at?: string }
+  return data as { ok: boolean; barcode?: string; fine_amount?: number; overdue_days?: number; copy_status?: string; hold_expires_at?: string }
 }
 
 export async function renewCopy(barcode: string) {
