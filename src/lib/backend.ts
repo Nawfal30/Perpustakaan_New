@@ -236,12 +236,13 @@ export async function checkoutCopies(memberNumber: string, barcodes: string[]) {
   return data as { ok: boolean; count: number; loans?: Array<{ barcode: string; due_date?: string }> }
 }
 
-export async function returnCopy(barcode: string, condition: "BAIK" | "RUSAK" | "HILANG") {
+export async function returnCopy(barcode: string, condition: "BAIK" | "RUSAK" | "HILANG", replacementAmount?: number) {
   if (!supabase) throw new Error("Supabase belum dikonfigurasi.")
   const { data, error } = await supabase.rpc("return_copy", {
     p_copy_barcode: barcode,
     p_condition: condition,
     p_idempotency_key: crypto.randomUUID(),
+    p_replacement_amount: replacementAmount ?? null,
   })
   if (error) fail(error, "Pengembalian gagal diproses.")
   return data as { ok: boolean; fine_amount?: number; overdue_days?: number; copy_status?: string; hold_expires_at?: string }
@@ -255,4 +256,23 @@ export async function renewCopy(barcode: string) {
   })
   if (error) fail(error, "Perpanjangan gagal diproses.")
   return data as { ok: boolean; due_date?: string }
+}
+
+
+export async function recordFinePayment(input: {
+  memberNumber: string
+  amount: number
+  method: "TUNAI" | "TRANSFER" | "QRIS_MANUAL" | "LAINNYA"
+  notes?: string
+}) {
+  if (!supabase) throw new Error("Supabase belum dikonfigurasi.")
+  const { data, error } = await supabase.rpc("record_payment", {
+    p_member_number: input.memberNumber,
+    p_amount: Math.round(input.amount),
+    p_method: input.method,
+    p_notes: input.notes || null,
+    p_idempotency_key: crypto.randomUUID(),
+  })
+  if (error) fail(error, "Pembayaran gagal dicatat.")
+  return data as { ok: boolean; payment_id?: string; amount?: number }
 }
