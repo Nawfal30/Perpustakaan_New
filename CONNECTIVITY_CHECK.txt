@@ -1,0 +1,2 @@
+Temporary connectivity test for GitHub read/write.
+Created 2026-10-14. This file is safe to remove after verification.
