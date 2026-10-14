@@ -1142,6 +1142,7 @@ function Catalog() {
 
   async function refreshCatalog() {
     if (!supabaseConfigured) return
+    setIsLive(true)
     setLoading(true)
     setError("")
     try {
@@ -1273,6 +1274,7 @@ function Members() {
 
   async function refreshMembers() {
     if (!supabaseConfigured) return
+    setIsLive(true)
     setError("")
     try {
       const [rows, cats] = await Promise.all([listMembers(), listMemberCategories()])
