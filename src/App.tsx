@@ -1,5 +1,20 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { supabase, supabaseConfigured } from "./lib/supabase"
+import {
+  checkoutCopies,
+  createCatalogItem,
+  createMember,
+  listCatalogEntries,
+  listMemberCategories,
+  listMembers,
+  loadDashboardStats,
+  renewCopy,
+  returnCopy,
+  type CatalogEntry,
+  type DashboardStats,
+  type MemberCategory,
+  type MemberEntry,
+} from "./lib/backend"
 
 type IconName = "home" | "scan" | "book" | "users" | "calendar" | "wallet" | "chart" | "settings" | "search" | "bell" | "chevron" | "arrow" | "check" | "x" | "clock" | "warning" | "wifi" | "menu" | "plus" | "filter" | "download" | "printer" | "mail" | "shield" | "barcode" | "spark" | "file" | "moon"
 
@@ -522,6 +537,12 @@ function AdminShell({
 }
 
 function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
+  const [liveStats, setLiveStats] = useState<DashboardStats | null>(null)
+  const [statsError, setStatsError] = useState("")
+  useEffect(() => {
+    if (!supabaseConfigured) return
+    void loadDashboardStats().then(setLiveStats).catch((e) => setStatsError(e instanceof Error ? e.message : "Statistik gagal dimuat."))
+  }, [])
   const bars = [34, 48, 42, 65, 50, 78, 62, 84, 58, 70, 91, 72, 80, 68]
   const today = new Intl.DateTimeFormat("id-ID", {
     weekday: "long",
@@ -541,38 +562,40 @@ function Dashboard({ onNavigate }: { onNavigate: (page: string) => void }) {
           </Button>
         }
       />
+      {statsError && <div className="alert alert-warning"><Icon name="warning" /><div><b>Statistik belum dimuat</b><span>{statsError}</span></div></div>}
+      {liveStats && <div className="report-note" style={{ marginBottom: 12 }}><Icon name="shield" /><span>Angka kartu ringkasan berasal dari database Supabase.</span></div>}
       <div className="stats-grid">
         <Stat
           label="Pinjaman aktif"
-          value="142"
-          detail="+12 minggu ini"
+          value={liveStats ? String(liveStats.activeLoans) : "142"}
+          detail={liveStats ? "data dari Supabase" : "+12 minggu ini"}
           icon="book"
         />
         <Stat
           label="Jatuh tempo hari ini"
-          value="18"
-          detail="11 belum dikonfirmasi"
+          value={liveStats ? String(liveStats.dueToday) : "18"}
+          detail={liveStats ? "jatuh tempo hari ini" : "11 belum dikonfirmasi"}
           tone="blue"
           icon="clock"
         />
         <Stat
           label="Terlambat"
-          value="9"
-          detail="3 lebih dari 30 hari"
+          value={liveStats ? String(liveStats.overdue) : "9"}
+          detail={liveStats ? "perlu ditindaklanjuti" : "3 lebih dari 30 hari"}
           tone="red"
           icon="warning"
         />
         <Stat
           label="Hold siap diambil"
-          value="7"
-          detail="2 berakhir hari ini"
+          value={liveStats ? String(liveStats.readyHolds) : "7"}
+          detail={liveStats ? "reservasi siap diambil" : "2 berakhir hari ini"}
           tone="purple"
           icon="calendar"
         />
         <Stat
           label="Denda outstanding"
-          value="Rp328.500"
-          detail="24 anggota"
+          value={liveStats ? new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(liveStats.outstandingFines) : "Rp328.500"}
+          detail={liveStats ? "total sisa denda" : "24 anggota"}
           tone="amber"
           icon="wallet"
         />
@@ -755,112 +778,105 @@ function Circulation() {
   const [tab, setTab] = useState<CirculationTab>("pinjam")
   const [step, setStep] = useState<"member" | "cart" | "success">("member")
   const [scan, setScan] = useState("")
-  const [condition, setCondition] = useState("Baik")
-  const doScan = () => {
-    if (tab === "pinjam") setStep(step === "member" ? "cart" : "cart")
-    else setStep("cart")
-    setScan("")
+  const [condition, setCondition] = useState("BAIK")
+  const [memberNumber, setMemberNumber] = useState("")
+  const [barcodes, setBarcodes] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+  const [successMessage, setSuccessMessage] = useState("")
+
+  function reset() {
+    setStep("member"); setScan(""); setMemberNumber(""); setBarcodes([])
+    setError(""); setSuccessMessage("")
   }
-  const reset = () => setStep("member")
+  function doScan() {
+    const code = scan.trim().toUpperCase()
+    if (!code) return
+    setError("")
+    if (tab === "pinjam" && step === "member") {
+      if (!code.startsWith("M-")) { setError("Pindai kode anggota terlebih dahulu, misalnya M-000123."); return }
+      setMemberNumber(code)
+      setStep("cart")
+      setScan("")
+      return
+    }
+    if (!code.startsWith("BK-") && !code.startsWith("EQ-") && !code.startsWith("OT-")) {
+      setError("Kode eksemplar tidak dikenali. Gunakan awalan BK-, EQ-, atau OT-.")
+      return
+    }
+    if (barcodes.includes(code)) {
+      setError(`${code} sudah ada dalam daftar scan.`)
+      setScan("")
+      return
+    }
+    if (tab === "pinjam") {
+      setBarcodes((current) => [...current, code])
+      setStep("cart")
+      setScan("")
+    } else {
+      setBarcodes([code])
+      setStep("cart")
+      setScan("")
+    }
+  }
+
+  async function finishTransaction() {
+    setError("")
+    if (!supabaseConfigured) {
+      setSuccessMessage("Mode demo: transaksi ini tidak disimpan ke database.")
+      setStep("success")
+      return
+    }
+    if (barcodes.length === 0) { setError("Pindai setidaknya satu kode eksemplar terlebih dahulu."); return }
+    setBusy(true)
+    try {
+      if (tab === "pinjam") {
+        if (!memberNumber) throw new Error("Pindai kartu anggota terlebih dahulu.")
+        const result = await checkoutCopies(memberNumber, barcodes)
+        const due = result.loans?.map((loan) => `${loan.barcode}: jatuh tempo ${loan.due_date || "ditetapkan"}`).join(" • ")
+        setSuccessMessage(`Peminjaman tersimpan. ${result.count} eksemplar diproses. ${due || ""}`)
+      } else if (tab === "kembali") {
+        const result = await returnCopy(barcodes[0], condition as "BAIK" | "RUSAK" | "HILANG")
+        setSuccessMessage(`Pengembalian tersimpan untuk ${result.barcode || barcodes[0]}. Denda tercatat: ${new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", maximumFractionDigits: 0 }).format(result.fine_amount || 0)}.${result.hold_expires_at ? " Eksemplar ditahan untuk antrean reservasi." : ""}`)
+      } else {
+        const result = await renewCopy(barcodes[0])
+        setSuccessMessage(`Perpanjangan tersimpan. Jatuh tempo baru: ${result.due_date || "lihat riwayat pinjaman"}.`)
+      }
+      setStep("success")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Transaksi gagal diproses.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <>
-      <PageTitle
-        eyebrow="OPERASIONAL"
-        title="Meja Sirkulasi"
-        description="Pindai kartu anggota dan kode barang. Sistem siap menerima input scanner."
-        action={
-          <div className="sound-toggle">
-            <Icon name="wifi" />
-            <span>Bunyi scan</span>
-            <i />
-          </div>
-        }
-      />
+      <PageTitle eyebrow="OPERASIONAL" title="Meja Sirkulasi" description="Pindai kode anggota dan barang. Keputusan transaksi divalidasi di database."
+        action={<div className="sound-toggle"><Icon name="wifi" /><span>{supabaseConfigured ? "Supabase" : "Mode demo"}</span><i /></div>} />
       <div className="circulation-tabs">
         {(["pinjam", "kembali", "perpanjang"] as const).map((t, i) => (
-          <button
-            key={t}
-            className={tab === t ? "active" : ""}
-            onClick={() => {
-              setTab(t)
-              reset()
-            }}
-          >
-            <span>{t[0].toUpperCase() + t.slice(1)}</span>
-            <kbd>F{i + 2}</kbd>
+          <button key={t} className={tab === t ? "active" : ""} onClick={() => { setTab(t); reset() }}>
+            <span>{t[0].toUpperCase() + t.slice(1)}</span><kbd>F{i + 2}</kbd>
           </button>
         ))}
-        <span className="esc">
-          Batalkan <kbd>Esc</kbd>
-        </span>
+        <span className="esc">Batalkan <kbd>Esc</kbd></span>
       </div>
       <div className={`scan-field ${step === "success" ? "scan-done" : ""}`}>
         <Icon name={step === "success" ? "check" : "scan"} size={26} />
         <label>
-          <span>
-            {tab === "pinjam" && step === "member"
-              ? "Pindai kartu anggota"
-              : tab === "pinjam"
-                ? "Pindai kode barang"
-                : `Pindai kode barang untuk ${tab}`}
-          </span>
-          <input
-            value={scan}
-            onChange={(e) => setScan(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && doScan()}
-            placeholder={
-              tab === "pinjam" && step === "member"
-                ? "Contoh: M-000123"
-                : "Contoh: BK-000123"
-            }
-            autoFocus
-          />
+          <span>{tab === "pinjam" && step === "member" ? "Pindai kartu anggota" : tab === "pinjam" ? "Pindai kode eksemplar" : `Pindai kode eksemplar untuk ${tab}`}</span>
+          <input value={scan} onChange={(e) => setScan(e.target.value)} onKeyDown={(e) => e.key === "Enter" && doScan()}
+            placeholder={tab === "pinjam" && step === "member" ? "Contoh: M-000123" : "Contoh: BK-000123"} autoFocus disabled={busy || step === "success"} />
         </label>
-        <Button onClick={doScan}>
-          Proses <kbd>Enter</kbd>
-        </Button>
+        <Button onClick={doScan} disabled={busy || step === "success"}>Proses <kbd>Enter</kbd></Button>
       </div>
-      {step === "member" && (
-        <div className="circulation-empty">
-          <div className="scan-illustration">
-            <Icon name="scan" size={40} />
-            <i />
-          </div>
-          <b>
-            {tab === "pinjam"
-              ? "Mulai dengan kartu anggota"
-              : `Pindai barang yang akan di${tab}`}
-          </b>
-          <span>
-            Scanner aktif dan siap. Anda juga dapat mengetik kode secara manual.
-          </span>
-          <div className="hint-row">
-            <span>
-              <kbd>F2</kbd> Pinjam
-            </span>
-            <span>
-              <kbd>F3</kbd> Kembali
-            </span>
-            <span>
-              <kbd>F4</kbd> Perpanjang
-            </span>
-          </div>
-        </div>
-      )}
-      {step === "cart" && tab === "pinjam" && (
-        <Checkout onFinish={() => setStep("success")} />
-      )}
-      {step === "cart" && tab === "kembali" && (
-        <ReturnPanel
-          condition={condition}
-          setCondition={setCondition}
-          onFinish={() => setStep("success")}
-        />
-      )}
-      {step === "cart" && tab === "perpanjang" && (
-        <RenewPanel onFinish={() => setStep("success")} />
-      )}
-      {step === "success" && <SuccessPanel tab={tab} onReset={reset} />}
+      {error && <div className="alert alert-danger" role="alert"><Icon name="warning" /><div><b>Transaksi belum diproses</b><span>{error}</span></div></div>}
+      {step === "member" && <div className="circulation-empty"><div className="scan-illustration"><Icon name="scan" size={40} /><i /></div><b>{tab === "pinjam" ? "Mulai dengan kartu anggota" : `Pindai barang yang akan di${tab}`}</b><span>Scanner USB/Bluetooth dapat digunakan atau ketik kode secara manual.</span><div className="hint-row"><span><kbd>F2</kbd> Pinjam</span><span><kbd>F3</kbd> Kembali</span><span><kbd>F4</kbd> Perpanjang</span></div></div>}
+      {step === "cart" && tab === "pinjam" && <Checkout memberNumber={memberNumber} barcodes={barcodes} onFinish={() => void finishTransaction()} busy={busy} />}
+      {step === "cart" && tab === "kembali" && <ReturnPanel barcode={barcodes[0] || ""} condition={condition} setCondition={setCondition} onFinish={() => void finishTransaction()} busy={busy} />}
+      {step === "cart" && tab === "perpanjang" && <RenewPanel barcode={barcodes[0] || ""} onFinish={() => void finishTransaction()} busy={busy} />}
+      {step === "success" && <section className="card success-panel"><div className="success-mark"><Icon name="check" size={34} /></div><div className="success-title">{tab === "pinjam" ? "Peminjaman berhasil" : tab === "kembali" ? "Pengembalian berhasil" : "Perpanjangan berhasil"}</div><p>{successMessage}</p><div className="button-row"><Button variant="secondary" icon="printer" onClick={() => window.print()}>Cetak ringkasan</Button><Button onClick={reset}>Transaksi berikutnya</Button></div></section>}
     </>
   )
 }
@@ -898,93 +914,27 @@ function MemberCard() {
     </section>
   )
 }
-function Checkout({ onFinish }: { onFinish: () => void }) {
+function Checkout({ onFinish, memberNumber, barcodes, busy }: { onFinish: () => void; memberNumber: string; barcodes: string[]; busy: boolean }) {
   const [override, setOverride] = useState(false)
   return (
     <div className="checkout-grid">
       <div>
-        <MemberCard />
-        <div className="alert alert-info">
-          <Icon name="shield" />
-          <div>
-            <b>Kebijakan Siswa</b>
-            <span>7 hari • Maks. 3 buku • 1× perpanjang • Rp500/hari</span>
-          </div>
-        </div>
+        <section className="card member-panel"><div className="member-head"><Avatar name={memberNumber || "Anggota"} /><div><b>{memberNumber || "Belum dipindai"}</b><span>Anggota akan divalidasi oleh database</span></div><Badge tone="info">SCAN</Badge></div><div className="mini-note"><Icon name="shield" /><span>Kuota, status anggota, denda, kebijakan, dan hak hold diperiksa server.</span></div></section>
+        <div className="alert alert-info"><Icon name="shield" /><div><b>Transaksi atomik</b><span>Jika satu eksemplar tidak memenuhi aturan, database membatalkan seluruh keranjang.</span></div></div>
       </div>
       <section className="card cart-panel">
-        <div className="section-head">
-          <div>
-            <b>Keranjang peminjaman</b>
-            <span>2 barang dipindai</span>
-          </div>
-          <Badge tone="info">2 ITEM</Badge>
-        </div>
-        <CartItem
-          code="BK-000123"
-          title="Laskar Pelangi"
-          meta="Buku • Rak A-03"
-          due="20 Okt 2026"
-        />
-        <CartItem
-          code="EQ-000045"
-          title="Bor Listrik Bosch"
-          meta="Peralatan • Gudang B"
-          due="16 Okt 2026"
-        />
-        <div className="alert alert-warning compact">
-          <Icon name="warning" />
-          <div>
-            <b>Scan ganda diabaikan</b>
-            <span>BK-000123 sudah ada di keranjang.</span>
-          </div>
-        </div>
-        <div className="cart-total">
-          <span>Jatuh tempo mengikuti kebijakan tiap barang</span>
-          <Button onClick={onFinish}>
-            Selesaikan peminjaman <kbd>Enter</kbd>
-          </Button>
-        </div>
-        <button
-          className="text-button override-link"
-          onClick={() => setOverride(true)}
-        >
-          Simulasikan penolakan kuota & override
-        </button>
+        <div className="section-head"><div><b>Keranjang peminjaman</b><span>{barcodes.length} eksemplar dipindai</span></div><Badge tone="info">{barcodes.length} ITEM</Badge></div>
+        {barcodes.map((code) => <CartItem key={code} code={code} title={code} meta="Akan diperiksa pada database" due="Mengikuti kebijakan" />)}
+        {barcodes.length === 0 && <div className="empty-state">Pindai kode eksemplar menggunakan kolom scan di atas.</div>}
+        <div className="alert alert-info compact"><Icon name="shield" /><div><b>Pencegahan scan ganda</b><span>Kode duplikat dalam keranjang akan ditolak sebelum dikirim.</span></div></div>
+        <div className="cart-total"><span>Jatuh tempo mengikuti kebijakan tiap barang</span><Button onClick={onFinish} disabled={barcodes.length === 0 || busy}>{busy ? "Memproses…" : "Selesaikan peminjaman"}</Button></div>
+        <button className="text-button override-link" onClick={() => setOverride(true)}>Informasi kuota & override</button>
       </section>
-      {override && (
-        <Modal
-          title="Override batas kuota"
-          onClose={() => setOverride(false)}
-          danger
-        >
-          <div className="alert alert-danger">
-            <Icon name="warning" />
-            <div>
-              <b>Kuota pinjam siswa (3 buku) sudah penuh.</b>
-              <span>
-                Kembalikan salah satu buku, atau minta Super Admin melakukan
-                override.
-              </span>
-            </div>
-          </div>
-          <Field
-            label="Alasan override (wajib)"
-            placeholder="Jelaskan alasan pengecualian..."
-          />
-          <div className="modal-actions">
-            <Button variant="secondary" onClick={() => setOverride(false)}>
-              Batal
-            </Button>
-            <Button variant="danger" onClick={() => setOverride(false)}>
-              Konfirmasi override
-            </Button>
-          </div>
-        </Modal>
-      )}
+      {override && <Modal title="Aturan peminjaman" onClose={() => setOverride(false)}><div className="alert alert-warning"><Icon name="warning" /><div><b>Override memerlukan hak khusus.</b><span>Jalur override beralasan wajib belum dibuka di UI. Transaksi standar tetap divalidasi server.</span></div></div><div className="modal-actions"><Button onClick={() => setOverride(false)}>Tutup</Button></div></Modal>}
     </div>
   )
 }
+
 function CartItem({
   code,
   title,
@@ -1016,143 +966,31 @@ function CartItem({
     </div>
   )
 }
-function ReturnPanel({
-  condition,
-  setCondition,
-  onFinish,
-}: {
-  condition: string
-  setCondition: (s: string) => void
-  onFinish: () => void
-}) {
+function ReturnPanel({ barcode, condition, setCondition, onFinish, busy }: { barcode: string; condition: string; setCondition: (s: string) => void; onFinish: () => void; busy: boolean }) {
   return (
     <div className="return-grid">
       <section className="card return-detail">
-        <div className="section-head">
-          <div>
-            <b>Barang ditemukan</b>
-            <span>BK-000123</span>
-          </div>
-          <Badge tone="info">DIPINJAM</Badge>
-        </div>
-        <div className="return-item">
-          <div className="item-thumb large">
-            <Icon name="book" size={28} />
-          </div>
-          <div>
-            <b>Laskar Pelangi</b>
-            <span>Dipinjam Sinta Putri • 25 Sep 2026</span>
-          </div>
-        </div>
-        <div className="detail-grid">
-          <span>
-            Jatuh tempo<b>1 Okt 2026</b>
-          </span>
-          <span>
-            Dikembalikan<b>12 Okt 2026</b>
-          </span>
-          <span>
-            Terlambat<b className="danger-text">10 hari kena denda</b>
-          </span>
-          <span>
-            Estimasi denda<b>Rp6.500</b>
-          </span>
-        </div>
-        <div className="field">
-          <span>Kondisi saat kembali</span>
-          <div className="choice-row">
-            {["Baik", "Rusak", "Hilang"].map((c) => (
-              <button
-                className={condition === c ? "active" : ""}
-                onClick={() => setCondition(c)}
-                key={c}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-        </div>
+        <div className="section-head"><div><b>Eksemplar dipindai</b><span>{barcode || "Belum ada kode"}</span></div><Badge tone="info">AKAN DIVALIDASI</Badge></div>
+        <div className="alert alert-info"><Icon name="shield" /><div><b>Pengembalian aman</b><span>Sistem mencari pinjaman aktif, menghitung denda resmi, serta meneruskan antrian dalam transaksi database.</span></div></div>
+        <div className="field"><span>Kondisi saat kembali</span><div className="choice-row">{[["BAIK","Baik"],["RUSAK","Rusak"],["HILANG","Hilang"]].map(([v,label]) => <button key={v} className={condition === v ? "active" : ""} onClick={() => setCondition(v)}>{label}</button>)}</div></div>
       </section>
-      <section className="card payment-panel">
-        <b>Penyelesaian denda</b>
-        <span>Pilih cara menangani denda anggota.</span>
-        <label className="radio-card">
-          <input type="radio" name="pay" defaultChecked />
-          <div>
-            <b>Catat pembayaran sekarang</b>
-            <span>Tunai, transfer, atau QRIS manual</span>
-          </div>
-        </label>
-        <label className="radio-card">
-          <input type="radio" name="pay" />
-          <div>
-            <b>Tagih nanti</b>
-            <span>Denda masuk ke tunggakan anggota</span>
-          </div>
-        </label>
-        <Button className="wide" onClick={onFinish}>
-          Proses pengembalian
-        </Button>
-      </section>
+      <section className="card payment-panel"><b>Konfirmasi pengembalian</b><span>Jika terlambat, denda ditambahkan ke buku besar. Barang rusak/hilang diperbarui sesuai kondisi.</span><Button className="wide" onClick={onFinish} disabled={!barcode || busy}>{busy ? "Memproses…" : "Proses pengembalian"}</Button></section>
     </div>
   )
 }
-function RenewPanel({ onFinish }: { onFinish: () => void }) {
-  const [blocked, setBlocked] = useState(false)
+
+function RenewPanel({ barcode, onFinish, busy }: { barcode: string; onFinish: () => void; busy: boolean }) {
   return (
     <div className="checkout-grid">
-      <MemberCard />
       <section className="card cart-panel">
-        <div className="section-head">
-          <div>
-            <b>Perpanjang pinjaman</b>
-            <span>BK-000123 • Laskar Pelangi</span>
-          </div>
-          <Badge tone={blocked ? "danger" : "success"}>
-            {blocked ? "DITOLAK" : "DAPAT DIPERPANJANG"}
-          </Badge>
-        </div>
-        {!blocked ? (
-          <>
-            <div className="renew-date">
-              <span>
-                Jatuh tempo lama<b>13 Okt 2026</b>
-              </span>
-              <Icon name="arrow" />
-              <span>
-                Jatuh tempo baru<b>20 Okt 2026</b>
-              </span>
-            </div>
-            <div className="alert alert-info">
-              <Icon name="calendar" />
-              <div>
-                <b>Perpanjangan 1 dari 1</b>
-                <span>Tidak ada anggota dalam antrian reservasi.</span>
-              </div>
-            </div>
-            <Button onClick={onFinish}>Konfirmasi perpanjangan</Button>
-          </>
-        ) : (
-          <div className="alert alert-danger">
-            <Icon name="x" />
-            <div>
-              <b>RENEWAL_BLOCKED_BY_QUEUE</b>
-              <span>
-                Tidak dapat diperpanjang karena ada 2 anggota dalam antrian.
-              </span>
-            </div>
-          </div>
-        )}
-        <button
-          className="text-button override-link"
-          onClick={() => setBlocked(!blocked)}
-        >
-          {blocked ? "Lihat state sukses" : "Lihat state ditolak"}
-        </button>
+        <div className="section-head"><div><b>Perpanjang pinjaman</b><span>{barcode || "Belum ada kode eksemplar"}</span></div><Badge tone="info">AKAN DIVALIDASI</Badge></div>
+        <div className="alert alert-info"><Icon name="shield" /><div><b>Validasi kebijakan</b><span>Status anggota, denda, batas perpanjangan, keterlambatan, dan antrian reservasi diverifikasi oleh database.</span></div></div>
+        <Button onClick={onFinish} disabled={!barcode || busy}>{busy ? "Memproses…" : "Konfirmasi perpanjangan"}</Button>
       </section>
     </div>
   )
 }
+
 function SuccessPanel({
   tab,
   onReset,
@@ -1285,126 +1123,130 @@ const catalogRows = [
 ]
 function Catalog() {
   const [detail, setDetail] = useState(false)
+  const [showCreate, setShowCreate] = useState(false)
+  const [catalog, setCatalog] = useState<CatalogEntry[]>([])
+  const [isLive, setIsLive] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState("")
+  const [query, setQuery] = useState("")
+  const [title, setTitle] = useState("")
+  const [kind, setKind] = useState<CatalogEntry["kind"]>("BUKU")
+  const [category, setCategory] = useState("Fiksi")
+  const [author, setAuthor] = useState("")
+  const [isbn, setIsbn] = useState("")
+  const [copies, setCopies] = useState("1")
+  const [saving, setSaving] = useState(false)
+  const [notice, setNotice] = useState("")
+
+  async function refreshCatalog() {
+    if (!supabaseConfigured) return
+    setLoading(true)
+    setError("")
+    try {
+      setCatalog(await listCatalogEntries())
+      setIsLive(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Katalog gagal dimuat.")
+    } finally {
+      setLoading(false)
+    }
+  }
+  useEffect(() => { void refreshCatalog() }, [])
+
+  const visibleRows = catalog.filter((row) =>
+    `${row.title} ${row.author} ${row.isbn || ""} ${row.barcodes.join(" ")} ${row.category}`
+      .toLowerCase().includes(query.toLowerCase()),
+  )
+
+  async function saveItem() {
+    if (!title.trim()) return
+    if (!isLive) {
+      setNotice("Mode demo: perubahan katalog tidak disimpan ke database.")
+      setShowCreate(false)
+      return
+    }
+    setSaving(true)
+    setError("")
+    try {
+      await createCatalogItem({ title: title.trim(), kind, category, author: author.trim(), isbn: isbn.trim(), copies: Math.max(1, Math.min(100, Number(copies) || 1)) })
+      setTitle(""); setAuthor(""); setIsbn(""); setCopies("1")
+      setShowCreate(false)
+      setNotice("Koleksi dan eksemplar berhasil disimpan.")
+      await refreshCatalog()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Koleksi gagal disimpan.")
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <>
       <PageTitle
         eyebrow="KOLEKSI"
         title="Katalog"
         description="Kelola judul, eksemplar, lokasi, dan status koleksi."
-        action={<Button icon="plus">Tambah item</Button>}
+        action={<Button icon="plus" onClick={() => { setNotice(""); setShowCreate(true) }}>Tambah item</Button>}
       />
       <div className="toolbar">
         <div className="search-box">
           <Icon name="search" />
-          <input placeholder="Cari judul, penulis, ISBN, atau kode..." />
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Cari judul, penulis, ISBN, atau kode..." />
         </div>
-        <Button variant="secondary" icon="filter">
-          Jenis: Semua
-        </Button>
+        <Button variant="secondary" icon="filter">Jenis: Semua</Button>
         <Button variant="secondary">Kategori</Button>
         <Button variant="secondary">Lokasi</Button>
-        <div className="view-toggle">
-          <button className="active">Tabel</button>
-          <button>Kartu</button>
-        </div>
+        <div className="view-toggle"><button className="active">Tabel</button></div>
       </div>
+      {(error || notice) && <div className={error ? "alert alert-danger" : "alert alert-success"} role="status"><Icon name={error ? "warning" : "check"} /><div><b>{error ? "Perlu diperiksa" : "Informasi"}</b><span>{error || notice}</span></div></div>}
+      {isLive && <div className="report-note" style={{ marginBottom: 10 }}><Icon name="shield" /><span>Data berasal dari Supabase. Semua perubahan divalidasi oleh database.</span></div>}
+      {!isLive && <div className="alert alert-info"><Icon name="wifi" /><div><b>Mode pratinjau</b><span>Contoh koleksi ditampilkan. Hubungkan Supabase untuk menyimpan koleksi secara permanen.</span></div></div>}
       <section className="card table-card">
         <div className="table-summary">
-          <span>
-            <b>1.284</b> judul • <b>2.842</b> eksemplar
-          </span>
-          <Button variant="ghost" icon="download">
-            Ekspor
-          </Button>
+          <span><b>{isLive ? catalog.length.toLocaleString("id-ID") : "1.284"}</b> judul {isLive ? "di database" : "contoh"} • eksemplar terdata</span>
+          <Button variant="ghost" icon="download" onClick={() => setNotice("Ekspor akan tersedia setelah modul laporan diintegrasikan.")}>Ekspor</Button>
         </div>
         <div className="data-table">
           <div className="tr th">
-            <span>
-              <input type="checkbox" />
-            </span>
-            <span>ITEM / KODE</span>
-            <span>JENIS</span>
-            <span>KETERSEDIAAN</span>
-            <span>LOKASI</span>
-            <span>STATUS</span>
-            <span />
+            <span>ITEM / KODE</span><span>JENIS</span><span>KETERSEDIAAN</span><span>LOKASI</span><span>STATUS</span><span />
           </div>
-          {catalogRows.map((r, i) => (
+          {isLive ? visibleRows.map((r, i) => (
+            <button className="tr" key={r.id} onClick={() => setDetail(true)}>
+              <span className="title-cell"><div className={`item-thumb color-${i % 4}`}><Icon name="book" /></div><i><b>{r.title}</b><small>{r.barcodes[0] || "Belum ada eksemplar"} • {r.author}</small></i></span>
+              <span>{r.kind === "BUKU" ? "Buku" : r.kind === "PERALATAN" ? "Peralatan" : "Lainnya"}</span>
+              <span><b>{r.availableCopies} dari {r.totalCopies}</b><small>{r.totalCopies === 0 ? "Belum ada eksemplar" : r.availableCopies ? "Siap dipinjam" : "Tidak tersedia"}</small></span>
+              <span>{r.location}</span>
+              <span><Badge tone={r.availableCopies > 0 ? "success" : "info"}>{r.availableCopies > 0 ? "TERSEDIA" : r.status}</Badge></span>
+              <span><Icon name="chevron" /></span>
+            </button>
+          )) : catalogRows.filter((r) => r.join(" ").toLowerCase().includes(query.toLowerCase())).map((r, i) => (
             <button className="tr" key={r[0]} onClick={() => setDetail(true)}>
-              <span>
-                <input type="checkbox" />
-              </span>
-              <span className="title-cell">
-                <div className={`item-thumb color-${i}`}>
-                  <Icon name="book" />
-                </div>
-                <i>
-                  <b>{r[1]}</b>
-                  <small>
-                    {r[0]} •{" "}
-                    {i === 0 ? "Andrea Hirata" : "Inventaris komunitas"}
-                  </small>
-                </i>
-              </span>
-              <span>{r[2]}</span>
-              <span>
-                <b>{r[3]}</b>
-                <small>{i === 2 ? "Antrian: 2" : "Siap dipinjam"}</small>
-              </span>
-              <span>{r[4]}</span>
-              <span>
-                <Badge tone={r[5] === "TERSEDIA" ? "success" : "info"}>
-                  {r[5]}
-                </Badge>
-              </span>
-              <span>
-                <Icon name="chevron" />
-              </span>
+              <span className="title-cell"><div className={`item-thumb color-${i}`}><Icon name="book" /></div><i><b>{r[1]}</b><small>{r[0]} • {i === 0 ? "Andrea Hirata" : "Inventaris komunitas"}</small></i></span>
+              <span>{r[2]}</span><span><b>{r[3]}</b><small>{i === 2 ? "Antrian: 2" : "Siap dipinjam"}</small></span><span>{r[4]}</span>
+              <span><Badge tone={r[5] === "TERSEDIA" ? "success" : "info"}>{r[5]}</Badge></span><span><Icon name="chevron" /></span>
             </button>
           ))}
-        </div>
-        <div className="pagination">
-          <span>Menampilkan 1–4 dari 1.284</span>
-          <div>
-            <Button variant="secondary">Sebelumnya</Button>
-            <Button variant="secondary">Berikutnya</Button>
-          </div>
+          {loading && <div className="empty-state">Memuat katalog dari Supabase…</div>}
+          {!loading && isLive && visibleRows.length === 0 && <div className="empty-state">Belum ada koleksi yang cocok dengan pencarian.</div>}
         </div>
       </section>
       {detail && (
-        <Modal title="Detail item" onClose={() => setDetail(false)}>
-          <div className="item-modal-head">
-            <div className="item-thumb large">
-              <Icon name="book" />
-            </div>
-            <div>
-              <Badge tone="success">BUKU</Badge>
-              <b>Laskar Pelangi</b>
-              <span>Andrea Hirata • ISBN 978-979-3062-79-2</span>
-            </div>
-          </div>
-          <div className="modal-tabs">
-            <b>Eksemplar (5)</b>
-            <span>Riwayat</span>
-            <span>Antrian (1)</span>
-          </div>
-          {["BK-000123", "BK-000124", "BK-000125"].map((x, i) => (
-            <div className="copy-row" key={x}>
-              <Icon name="barcode" />
-              <span>
-                <b>{x}</b>
-                <small>Rak A-03</small>
-              </span>
-              <Badge tone={i === 0 ? "success" : "info"}>
-                {i === 0 ? "TERSEDIA" : "DIPINJAM"}
-              </Badge>
-            </div>
-          ))}
-          <div className="modal-actions">
-            <Button variant="secondary" icon="printer">
-              Cetak label
-            </Button>
-            <Button>Tambah eksemplar</Button>
+        <Modal title="Detail eksemplar" onClose={() => setDetail(false)}>
+          <div className="alert alert-info"><Icon name="shield" /><div><b>Status divalidasi server</b><span>Perubahan transaksi dilakukan melalui RPC Supabase, bukan hanya dari tampilan.</span></div></div>
+          <div className="modal-actions"><Button onClick={() => setDetail(false)}>Tutup</Button></div>
+        </Modal>
+      )}
+      {showCreate && (
+        <Modal title="Tambah koleksi" onClose={() => setShowCreate(false)}>
+          <div className="settings-form">
+            <Field label="Judul / nama barang *" value={title} onChange={setTitle} />
+            <label className="field"><span>Jenis item</span><select value={kind} onChange={(e) => setKind(e.target.value as CatalogEntry["kind"])}><option value="BUKU">Buku</option><option value="PERALATAN">Peralatan</option><option value="LAINNYA">Lainnya</option></select></label>
+            <Field label="Kategori" value={category} onChange={setCategory} />
+            <Field label="Penulis / merek" value={author} onChange={setAuthor} />
+            <Field label="ISBN (opsional)" value={isbn} onChange={setIsbn} />
+            <Field label="Jumlah eksemplar (1–100)" value={copies} onChange={setCopies} type="number" />
+            {!isLive && <div className="alert alert-warning"><Icon name="warning" /><div><b>Belum tersambung</b><span>Data tidak akan tersimpan permanen sampai variabel Supabase dikonfigurasi.</span></div></div>}
+            <div className="modal-actions"><Button variant="secondary" onClick={() => setShowCreate(false)}>Batal</Button><Button disabled={!title.trim() || saving} onClick={() => void saveItem()}>{saving ? "Menyimpan…" : "Simpan koleksi"}</Button></div>
           </div>
         </Modal>
       )}
@@ -1414,113 +1256,106 @@ function Catalog() {
 
 function Members() {
   const [card, setCard] = useState(false)
+  const [showCreate, setShowCreate] = useState(false)
+  const [isLive, setIsLive] = useState(false)
+  const [members, setMembers] = useState<MemberEntry[]>([])
+  const [categories, setCategories] = useState<MemberCategory[]>([])
+  const [query, setQuery] = useState("")
+  const [name, setName] = useState("")
+  const [categoryId, setCategoryId] = useState("")
+  const [email, setEmail] = useState("")
+  const [phone, setPhone] = useState("")
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
+
+  async function refreshMembers() {
+    if (!supabaseConfigured) return
+    setError("")
+    try {
+      const [rows, cats] = await Promise.all([listMembers(), listMemberCategories()])
+      setMembers(rows)
+      setCategories(cats)
+      setCategoryId((current) => current || cats[0]?.id || "")
+      setIsLive(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Anggota gagal dimuat.")
+    }
+  }
+  useEffect(() => { void refreshMembers() }, [])
+
   const people = [
     ["Sinta Putri", "M-000123", "Siswa", "2", "Rp0", "AKTIF"],
     ["Pak Dedi", "M-000097", "Warga", "1", "Rp2.500", "AKTIF"],
     ["Pak Anton", "M-000084", "Warga", "0", "Rp0", "DISUSPEND"],
     ["Bu Maya", "M-000041", "Pengurus", "3", "Rp6.500", "AKTIF"],
   ]
+  const visibleMembers = members.filter((p) => `${p.name} ${p.code} ${p.category} ${p.email} ${p.phone}`.toLowerCase().includes(query.toLowerCase()))
+
+  async function saveMember() {
+    if (!name.trim() || !categoryId) return
+    if (!isLive) {
+      setNotice("Mode demo: data anggota belum tersimpan ke database.")
+      setShowCreate(false)
+      return
+    }
+    setSaving(true); setError("")
+    try {
+      await createMember({ name: name.trim(), categoryId, email: email.trim(), phone: phone.trim() })
+      setName(""); setEmail(""); setPhone(""); setShowCreate(false)
+      setNotice("Anggota berhasil didaftarkan.")
+      await refreshMembers()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Anggota gagal didaftarkan.")
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <>
-      <PageTitle
-        eyebrow="KOMUNITAS"
-        title="Anggota"
-        description="Kelola data, status, dan aktivitas anggota."
-        action={
-          <Button icon="plus" onClick={() => setCard(true)}>
-            Daftarkan anggota
-          </Button>
-        }
-      />
+      <PageTitle eyebrow="KOMUNITAS" title="Anggota" description="Kelola data, status, dan aktivitas anggota."
+        action={<Button icon="plus" onClick={() => { setError(""); setNotice(""); setShowCreate(true) }}>Daftarkan anggota</Button>} />
       <div className="toolbar">
-        <div className="search-box">
-          <Icon name="search" />
-          <input placeholder="Cari nama, ID anggota, atau kontak..." />
-        </div>
-        <Button variant="secondary" icon="filter">
-          Status: Semua
-        </Button>
-        <Button variant="secondary">Kategori: Semua</Button>
+        <div className="search-box"><Icon name="search" /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Cari nama, ID anggota, atau kontak..." /></div>
+        <Button variant="secondary" icon="filter">Status: Semua</Button><Button variant="secondary">Kategori: Semua</Button>
       </div>
+      {(error || notice) && <div className={error ? "alert alert-danger" : "alert alert-success"} role="status"><Icon name={error ? "warning" : "check"} /><div><b>{error ? "Perlu diperiksa" : "Informasi"}</b><span>{error || notice}</span></div></div>}
+      {!isLive && <div className="alert alert-info"><Icon name="wifi" /><div><b>Mode pratinjau</b><span>Contoh anggota ditampilkan. Hubungkan Supabase untuk membaca dan menyimpan data nyata.</span></div></div>}
       <section className="card table-card">
         <div className="data-table member-table">
-          <div className="tr th">
-            <span>ANGGOTA</span>
-            <span>KATEGORI</span>
-            <span>PINJAMAN AKTIF</span>
-            <span>DENDA</span>
-            <span>STATUS</span>
-            <span />
-          </div>
-          {people.map((p) => (
+          <div className="tr th"><span>ANGGOTA</span><span>KATEGORI</span><span>PINJAMAN AKTIF</span><span>DENDA</span><span>STATUS</span><span /></div>
+          {isLive ? visibleMembers.map((p) => (
+            <button className="tr" key={p.id} onClick={() => setCard(true)}>
+              <span className="person-cell"><Avatar name={p.name} small /><i><b>{p.name}</b><small>{p.code} • {p.email || p.phone || "Kontak belum diisi"}</small></i></span>
+              <span>{p.category}</span><span>{p.activeLoans} item</span><span>{new Intl.NumberFormat("id-ID",{style:"currency",currency:"IDR",maximumFractionDigits:0}).format(p.outstandingFine)}</span>
+              <span><Badge tone={p.status === "AKTIF" ? "success" : "warning"}>{p.status}</Badge></span><span><Icon name="chevron" /></span>
+            </button>
+          )) : people.filter((p) => p.join(" ").toLowerCase().includes(query.toLowerCase())).map((p) => (
             <button className="tr" key={p[1]} onClick={() => setCard(true)}>
-              <span className="person-cell">
-                <Avatar name={p[0]} small />
-                <i>
-                  <b>{p[0]}</b>
-                  <small>
-                    {p[1]} • {p[0].replace(" ", ".").toLowerCase()}@contoh.id
-                  </small>
-                </i>
-              </span>
-              <span>{p[2]}</span>
-              <span>{p[3]} item</span>
-              <span>{p[4]}</span>
-              <span>
-                <Badge tone={p[5] === "AKTIF" ? "success" : "warning"}>
-                  {p[5]}
-                </Badge>
-              </span>
-              <span>
-                <Icon name="chevron" />
-              </span>
+              <span className="person-cell"><Avatar name={p[0]} small /><i><b>{p[0]}</b><small>{p[1]} • {p[0].replace(" ", ".").toLowerCase()}@contoh.id</small></i></span>
+              <span>{p[2]}</span><span>{p[3]} item</span><span>{p[4]}</span><span><Badge tone={p[5] === "AKTIF" ? "success" : "warning"}>{p[5]}</Badge></span><span><Icon name="chevron" /></span>
             </button>
           ))}
+          {isLive && visibleMembers.length === 0 && <div className="empty-state">Belum ada anggota yang cocok dengan pencarian.</div>}
         </div>
       </section>
       {card && (
-        <Modal title="Kartu anggota digital" onClose={() => setCard(false)}>
-          <div className="member-id-card">
-            <div className="id-brand">
-              <div className="logo light">
-                <Icon name="book" />
-              </div>
-              <span>
-                PUSTAKA BERSAMA<small>Perpustakaan Cendekia</small>
-              </span>
-            </div>
-            <div className="id-person">
-              <Avatar name="Sinta Putri" />
-              <span>
-                <b>Sinta Putri</b>
-                <small>Siswa • M-000123</small>
-              </span>
-            </div>
-            <div className="qr">
-              <div className="qr-grid">
-                {Array.from({ length: 64 }).map((_, i) => (
-                  <i
-                    className={(i * 7 + (i % 5)) % 3 === 0 ? "on" : ""}
-                    key={i}
-                  />
-                ))}
-              </div>
-              <span>M-000123</span>
-            </div>
-            <small>Berlaku hingga 30 Jun 2027</small>
-          </div>
-          <div className="alert alert-warning">
-            <Icon name="warning" />
-            <div>
-              <b>Kemiripan data ditemukan</b>
-              <span>
-                Ada anggota bernama “Sinta P.” dengan nomor kontak serupa.
-              </span>
-            </div>
-          </div>
-          <div className="modal-actions">
-            <Button variant="secondary">Lihat detail</Button>
-            <Button icon="printer">Cetak kartu</Button>
+        <Modal title="Detail anggota" onClose={() => setCard(false)}>
+          <div className="alert alert-info"><Icon name="shield" /><div><b>Data anggota privat</b><span>Detail lengkap akan ditampilkan sesuai izin pengguna dan organisasi.</span></div></div>
+          <div className="modal-actions"><Button onClick={() => setCard(false)}>Tutup</Button></div>
+        </Modal>
+      )}
+      {showCreate && (
+        <Modal title="Daftarkan anggota" onClose={() => setShowCreate(false)}>
+          <div className="settings-form">
+            <Field label="Nama lengkap *" value={name} onChange={setName} />
+            <label className="field"><span>Kategori anggota *</span><select value={categoryId} onChange={(e) => setCategoryId(e.target.value)}><option value="">Pilih kategori</option>{categories.map((cat) => <option key={cat.id} value={cat.id}>{cat.name}</option>)}</select></label>
+            <Field label="Email (opsional)" value={email} onChange={setEmail} type="email" />
+            <Field label="Telepon / WhatsApp (opsional)" value={phone} onChange={setPhone} />
+            {!isLive && <div className="alert alert-warning"><Icon name="warning" /><div><b>Belum tersambung</b><span>Pendaftaran tidak akan tersimpan permanen sampai Supabase dikonfigurasi.</span></div></div>}
+            {isLive && categories.length === 0 && <div className="alert alert-warning"><Icon name="warning" /><div><b>Kategori belum tersedia</b><span>Super Admin perlu membuat kategori anggota terlebih dahulu.</span></div></div>}
+            <div className="modal-actions"><Button variant="secondary" onClick={() => setShowCreate(false)}>Batal</Button><Button disabled={!name.trim() || !categoryId || saving} onClick={() => void saveMember()}>{saving ? "Menyimpan…" : "Simpan anggota"}</Button></div>
           </div>
         </Modal>
       )}
