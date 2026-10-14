@@ -140,7 +140,7 @@ const paths: Record<IconName, ReactNode> = {
   moon: <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z" />,
 }
 
-function Icon({ name, size = 18 }: { name: IconName size?: number }) {
+function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   return (
     <svg
       width={size}
@@ -234,7 +234,7 @@ function Badge({
   )
 }
 
-function Avatar({ name, small = false }: { name: string small?: boolean }) {
+function Avatar({ name, small = false }: { name: string; small?: boolean }) {
   return (
     <div className={`avatar ${small ? "avatar-small" : ""}`}>
       {name
